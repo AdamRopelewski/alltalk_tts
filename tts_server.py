@@ -2307,6 +2307,7 @@ class TTSItem(BaseModel):
     text: str
     characterVoice: str
     language: str
+    accepted: bool = False
 
 class TTSData(BaseModel):
     """Collection of TTS items."""
@@ -2339,6 +2340,80 @@ async def apifunction_save_tts_data(tts_data: List[TTSItem]):
 ########################################
 # Trigger TTS Gen Text/Speech Analysis #
 ########################################
+import threading
+
+_analysis_lock = threading.Lock()
+
+class AnalysisStreamingResponse(StreamingResponse):
+    def __init__(self, content, cleanup):
+        super().__init__(content, media_type="application/x-ndjson")
+        self.cleanup = cleanup
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await asyncio.shield(asyncio.to_thread(self.cleanup))
+
+@app.post("/api/stream-analysis")
+def stream_analysis(items: List[TTSItem], threshold: int = Query(default=98, ge=1, le=100), whisper_model: str = Query(default="large-v3")):
+    if not items:
+        raise HTTPException(status_code=400, detail="Select at least one item")
+    if whisper_model not in {"tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "turbo"}:
+        raise HTTPException(status_code=400, detail="Invalid Whisper model")
+    if len({item.id for item in items}) != len(items):
+        raise HTTPException(status_code=400, detail="Duplicate item IDs")
+    if not _analysis_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Analysis already running")
+
+    state_lock = threading.Lock()
+    state = {"process": None, "closed": False}
+
+    def cleanup():
+        with state_lock:
+            if state["closed"]:
+                return
+            state["closed"] = True
+            process = state["process"]
+            try:
+                if process:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    if process.stdin and not process.stdin.closed:
+                        process.stdin.close()
+                    if process.stdout:
+                        process.stdout.close()
+            finally:
+                _analysis_lock.release()
+
+    def stream():
+        try:
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            with state_lock:
+                if state["closed"]:
+                    return
+                process = subprocess.Popen(
+                    [sys.executable, "-u", str(this_dir / "system" / "tts_diff" / "tts_diff.py"),
+                     "--stream", f"--threshold={threshold}", f"--wavfilespath={this_dir / config.get_output_directory()}",
+                     f"--whisper-model={whisper_model}"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", env=env,
+                )
+                state["process"] = process
+            process.stdin.write(json.dumps([item.model_dump() for item in items], ensure_ascii=False))
+            process.stdin.close()
+            for line in process.stdout:
+                yield line
+            if process.wait() != 0:
+                yield json.dumps({"type": "fatal", "error": "Whisper analysis failed"}) + "\n"
+        except Exception as exc:
+            yield json.dumps({"type": "fatal", "error": str(exc)}) + "\n"
+        finally:
+            cleanup()
+
+    return AnalysisStreamingResponse(stream(), cleanup)
+
 @app.get("/api/trigger-analysis")
 async def apifunction_trigger_analysis(threshold: int = Query(default=98), whisper_model: str = Query(default="large-v3")):
     """Trigger Whisper analysis to compare generated TTS against original text.
@@ -2347,6 +2422,8 @@ async def apifunction_trigger_analysis(threshold: int = Query(default=98), whisp
         threshold: Minimum acceptable match percentage (default: 98)
     """
     debug_func_entry()
+    if not _analysis_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Analysis already running")
 
     try:
         # Setup environment
@@ -2402,6 +2479,8 @@ async def apifunction_trigger_analysis(threshold: int = Query(default=98), whisp
     except Exception as e:
         print_message(f"Error during analysis: {str(e)}", "error", "GEN")
         raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        _analysis_lock.release()
 
 ###########################################
 # TTS Generator SRT Subtitiles generation #

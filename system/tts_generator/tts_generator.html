@@ -367,8 +367,86 @@
         }
 
         .problematic {
+            background-color: transparent;
+        }
+
+        .item-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex: 0 0 auto;
+            padding: 5px 8px;
+            border-radius: 3px;
+        }
+
+        .problematic .item-controls {
             background-color: rgb(179, 104, 104);
-            /* Or any light red color of your choice */
+        }
+
+        .analysis-number { color: #1468b3; text-decoration: underline; cursor: pointer; }
+        .analysis-text {
+            white-space: normal;
+            overflow: visible;
+            text-overflow: clip;
+        }
+
+        .analysis-mismatch {
+            border-bottom: 2px solid #ffb3b3;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        .analysis-insert {
+            margin-left: 4px;
+            padding: 1px 4px;
+            border: 1px solid #ffb3b3;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+
+        .analysis-mismatch:focus,
+        .analysis-insert:focus {
+            outline: 2px solid #ffb3b3;
+            outline-offset: 2px;
+        }
+
+        .analysis-score {
+            margin-left: 6px;
+            color: #ffd0d0;
+            white-space: nowrap;
+        }
+
+        .analysis-popover {
+            position: fixed;
+            z-index: 10000;
+            max-width: min(420px, calc(100vw - 16px));
+            padding: 10px 12px;
+            background: #181818;
+            color: #f2f2f2;
+            border: 1px solid #666;
+            border-radius: 6px;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, .45);
+            font-size: 13px;
+            line-height: 1.4;
+        }
+
+        .analysis-popover-row + .analysis-popover-row {
+            margin-top: 7px;
+            padding-top: 7px;
+            border-top: 1px solid #3f3f3f;
+        }
+
+        .analysis-popover-label {
+            display: inline-block;
+            min-width: 58px;
+            margin-right: 6px;
+            font-weight: bold;
+            color: #d8d8d8;
+        }
+
+        .analysis-popover-value {
+            overflow-wrap: anywhere;
         }
 
         .highlight-count {
@@ -500,6 +578,13 @@
         #paginationControls1 input[type="number"] {
             /* Apply the input styling */
             margin-top: 15px
+        }
+
+        /* Pagination is intentionally disabled: keep the existing controls in the DOM
+           so legacy listeners keep working, but render one continuous list. */
+        #paginationControls,
+        #paginationControls1 {
+            display: none;
         }
 
         #customFileName {
@@ -665,6 +750,24 @@
                 <span id="volumeValue">0.8</span>
             </div>
         </div>
+
+        <div class="setting slider-setting-wrapper">
+            <label for="temperature">Temperature:</label>
+            <div class="slider-container">
+                <input type="range" id="temperature" name="temperature" class="slider-setting" min="0.1" max="1.0" step="0.05"
+                    value="0.75" oninput="updateTemperatureValue(this.value)">
+                <span id="temperatureValue">0.75</span>
+            </div>
+        </div>
+
+        <div class="setting slider-setting-wrapper">
+            <label for="repetitionPenalty">Repetition Penalty:</label>
+            <div class="slider-container">
+                <input type="range" id="repetitionPenalty" name="repetitionPenalty" class="slider-setting" min="1" max="20" step="0.5"
+                    value="10" oninput="updateRepetitionPenaltyValue(this.value)">
+                <span id="repetitionPenaltyValue">10</span>
+            </div>
+        </div>
     </div>
 
     <div class="action-buttons">
@@ -713,6 +816,7 @@
         <option value="600">600</option>
     </select>
     <button class="conditional-btn" id="saveAndAnalyzeTTS" style="margin-right: 10px;">Analyze TTS</button>
+    <span id="analysisProgress" role="status"></span>
     <label for="AnalyzeAccuracy">% Accuracy:</label>
     <select id="AnalyzeAccuracy" name="AnalyzeAccuracy" style="margin-right: 10px;">
         <option value="99">99</option>
@@ -728,13 +832,14 @@
     </select>
     <label for="whisperModel">WhisperV:</label>
     <select id="whisperModel" name="whisperModel" class="fixed-size-dropdown">
-        <option value="large-v3" selected>Large-v3 (Default)</option>
+	    <option value="large-v3-turbo" selected>Large-v3-Turbo</option>
+        <option value="large-v3">Large-v3</option>
         <option value="tiny">Tiny</option>
         <option value="base">Base</option>
         <option value="small">Small</option>
         <option value="medium">Medium</option>
         <option value="turbo">Turbo</option>
-        <option value="large-v3-turbo">Large-v3-Turbo</option>
+
     </select>
     <div id="paginationControls">
         <button class="conditional-btn pagination-btn" id="prevPage">Previous</button>
@@ -914,6 +1019,23 @@
     let RVCVoice = document.getElementById("RVC_voice_gen").value;
     let ttsList = []; // Global list to store TTS details
     let problematicIds = []; // Global list to store ProblematicIDs
+    let analysisResults = new Map(); // Detailed Whisper results keyed by TTS ID
+    let analysisBusy = false;
+    const revisions = new WeakMap();
+    function invalidateAnalysis(item) {
+        revisions.set(item, (revisions.get(item) || 0) + 1);
+        item.accepted = false;
+        analysisResults.delete(Number(item.id));
+        problematicIds = problematicIds.filter(id => Number(id) !== Number(item.id));
+    }
+    function toggleAcceptance(id) {
+        const item = ttsList.find(item => Number(item.id) === id);
+        if (!item) return;
+        const accepted = !item.accepted;
+        invalidateAnalysis(item);
+        item.accepted = accepted;
+        updateUIList();
+    }
     const howlInstances = {};
     let listPlaying = false;
     let listPlayIndex = 0;
@@ -974,55 +1096,66 @@
     //////// Compare TTS list ////////
     //////////////////////////////////
 
-    document.getElementById('saveAndAnalyzeTTS').addEventListener('click', async function () {
-        showProgress(); // Call this function to show the progress indicator at the start of the process
-        try {
-            // Serialize the ttsList data structure to a JSON string
-            const ttsDataJSON = JSON.stringify(ttsList);
-
-            // Send the serialized ttsList to the '/save-tts-data' endpoint
-            const saveResponse = await fetch('/api/save-tts-data', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: ttsDataJSON  // Use the serialized JSON string as the request body
-            });
-
-            const saveData = await saveResponse.json();
-
-            // Log the server's response
-            console.log(saveData.message);
-
-            // If the server confirms the data was saved successfully, trigger analysis
-            if (saveData.message === "Data saved successfully") {
-                const accuracy = parseInt(document.getElementById('AnalyzeAccuracy').value) || 98;
-                const whisperModel = document.getElementById('whisperModel').value;
-                const analyzeResponse = await fetch(`/api/trigger-analysis?threshold=${accuracy}&whisper_model=${whisperModel}`);
-                const analyzeData = await analyzeResponse.json();
-                if (analyzeData.summary.flagged_ids && analyzeData.summary.flagged_ids.length > 0) {
-                    // Update the global problematicIds array with the new flagged IDs
-                    problematicIds = analyzeData.summary.flagged_ids;
-                    console.log("Initial problematicIds from analysis:", problematicIds); // Debugging: Check the initial array after receiving analysis results
-
-                    // Call highlightProblems with the array of flagged IDs
-                    highlightProblems(problematicIds);
-                } else {
-                    console.log("No problematic IDs or error retrieving data.");
-
-                    // Clear the problematicIds array since there are no problematic IDs
-                    problematicIds = [];
-                    highlightProblems(problematicIds);
-                }
-                // Optionally, you might want to provide feedback in the UI about the analysis status
-            } else {
-                throw new Error('Data save was unsuccessful.');
-            }
-        } catch (error) {
-            // Handle any errors that occurred during the fetch process
-            console.error('Error:', error);
-        } finally {
-            hideProgress(); // Hide the progress indicator when the process is complete or if an error occurs
-        }
+    document.getElementById('saveAndAnalyzeTTS').addEventListener('click', () => {
+        runAnalysis(ttsList.filter(item => !item.accepted));
     });
+
+    async function runAnalysis(items) {
+        if (analysisBusy || !items.length) return;
+        const editor = document.querySelector('.edit-input');
+        if (editor) editor.blur();
+        analysisBusy = true;
+        document.getElementById('saveAndAnalyzeTTS').disabled = true;
+        const progress = document.getElementById('analysisProgress');
+        const snapshots = new Map();
+        items.forEach(item => {
+            invalidateAnalysis(item);
+            snapshots.set(Number(item.id), {item, revision: revisions.get(item)});
+        });
+        updateUIList();
+        progress.textContent = `Analyzing 0 / ${items.length}`;
+        let completed = false;
+        try {
+            const accuracy = document.getElementById('AnalyzeAccuracy').value;
+            const model = encodeURIComponent(document.getElementById('whisperModel').value);
+            const response = await fetch(`/api/stream-analysis?threshold=${accuracy}&whisper_model=${model}`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(items)
+            });
+            if (!response.ok) throw new Error((await response.json()).detail || 'Analysis failed');
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const chunk = await reader.read();
+                buffer += decoder.decode(chunk.value || new Uint8Array(), {stream: !chunk.done});
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    const record = JSON.parse(line);
+                    if (record.type === 'fatal') throw new Error(record.error);
+                    if (record.type === 'complete') { completed = true; continue; }
+                    if (record.type !== 'result') continue;
+                    const snapshot = snapshots.get(Number(record.id));
+                    if (snapshot && ttsList.includes(snapshot.item) && revisions.get(snapshot.item) === snapshot.revision) {
+                        analysisResults.set(Number(record.id), record);
+                        if (record.status === 'review' || record.status === 'error') problematicIds.push(Number(record.id));
+                        updateUIList();
+                    }
+                    progress.textContent = `Analyzing ${record.completed} / ${record.total}`;
+                }
+                if (chunk.done) break;
+            }
+            if (!completed) throw new Error('Analysis interrupted');
+            progress.textContent = `Analysis complete: ${items.length} / ${items.length}`;
+        } catch (error) {
+            progress.textContent = `Analysis stopped: ${error.message}`;
+        } finally {
+            analysisBusy = false;
+            document.getElementById('saveAndAnalyzeTTS').disabled = false;
+            updateUIList();
+        }
+    }
 
     function highlightProblems(idsToHighlight) {
         // First, clear all previous 'problematic' highlights
@@ -1101,6 +1234,8 @@
             const RVCVoice = document.getElementById("RVC_voice_gen").value;
             const RVCPitch = document.getElementById("RVC_voice_pitch").value;
             const volume = parseFloat(document.getElementById("volume").value);
+            const temperature = parseFloat(document.getElementById("temperature").value);
+            const repetitionPenalty = parseFloat(document.getElementById("repetitionPenalty").value);
             const chunkSize = parseInt(document.getElementById("chunkSize").value);
             const playType = document.getElementById('playType').value; // Play type (chunk or stream)
             const customFileName = document.getElementById("customFileName").value; // Get the custom file name
@@ -1151,14 +1286,15 @@
                     if (stopTTSGeneration) break;
                     showProgress(i + 1, totalChunks, playType);
                     if (playModeValue === 'local') {
-                        // Generate the chunk and play it locally
-                        await generateAndCache(chunks[i], language, characterVoice, RVCVoice, RVCPitch, volume, customFileName);
+                            // Generate the chunk and play it locally
+                            // Pass null for chunkIndex and id to place temperature/repetition into the right args
+                            await generateAndCache(chunks[i], language, characterVoice, RVCVoice, RVCPitch, volume, customFileName, null, null, temperature, repetitionPenalty);
                     } else if (playModeValue === 'remote') {
-                        // Generate the chunk and play it remotely
-                        await generateAndPlayRemote(chunks[i], language, characterVoice, RVCVoice, RVCPitch, volume, customFileName);
+                            // Generate the chunk and play it remotely
+                            await generateAndPlayRemote(chunks[i], language, characterVoice, RVCVoice, RVCPitch, volume, customFileName, temperature, repetitionPenalty);
                     } else if (playModeValue === 'none') {
-                        // Generate the chunk but do not play it
-                        await generateWithoutPlayback(chunks[i], language, characterVoice, RVCVoice, RVCPitch, customFileName);
+                            // Generate the chunk but do not play it
+                            await generateWithoutPlayback(chunks[i], language, characterVoice, RVCVoice, RVCPitch, customFileName, temperature, repetitionPenalty);
                     }
                 }
             }
@@ -1173,10 +1309,7 @@
     async function processChunks(chunks, language, characterVoice, RVCVoice, RVCPitch, volume, customFileName) {
         for (let i = 0; i < chunks.length; i++) {
             if (stopTTSGeneration) break;
-            await generateAndCache(chunks[i], language, characterVoice, RVCVoice, RVCPitch, volume, customFileName, i + 1); // Pass custom file name and chunk index
-            if (audioQueue.length >= preloadThreshold && !isPlaying) {
-                playNextLocalChunk();
-            }
+            await generateAndCache(chunks[i], language, characterVoice, RVCVoice, RVCPitch, volume, customFileName, i + 1, null, null); // Pass custom file name and chunk index
         }
     }
 
@@ -1188,7 +1321,7 @@
         });
     }
 
-    async function generateAndCache(chunk, language, characterVoice, RVCVoice, RVCPitch, volume, customFileName, chunkIndex = null, id = null) {
+    async function generateAndCache(chunk, language, characterVoice, RVCVoice, RVCPitch, volume, customFileName, chunkIndex = null, id = null, temperature = null, repetitionPenalty = null) {
         try {
             let paddedChunkIndex;
 
@@ -1203,6 +1336,10 @@
 
             // Generate a 4-character UUID
             const uuid = generateUUID();
+
+            // If values were not passed into the function, read from DOM
+            if (temperature === null) temperature = parseFloat(document.getElementById('temperature').value);
+            if (repetitionPenalty === null) repetitionPenalty = parseFloat(document.getElementById('repetitionPenalty').value);
 
             const data = new URLSearchParams({
                 text_input: chunk.trim(),
@@ -1219,6 +1356,9 @@
                 autoplay: "false",
                 autoplay_volume: volume
             });
+            // Add optional temperature and repetition penalty
+            data.append('temperature', temperature);
+            data.append('repetition_penalty', repetitionPenalty);
 
             const response = await fetch(baseUrl + "/api/tts-generate", {
                 method: "POST",
@@ -1235,6 +1375,7 @@
                 if (id !== null) {
                     let itemIndex = ttsList.findIndex(item => item.id === id);
                     if (itemIndex !== -1) {
+                        invalidateAnalysis(ttsList[itemIndex]);
                         ttsList[itemIndex].fileUrl = result.output_file_url;
                         // Other properties can be updated as needed, e.g., in case the language or voice has changed
                         ttsList[itemIndex].language = language;
@@ -1266,9 +1407,6 @@
                 });
                 audioQueue.push(sound);
                 updateUIList(); // Refresh the list display
-                if (audioQueue.length >= preloadThreshold && !isPlaying) {
-                    playNextLocalChunk();
-                }
             }
             return result
         } catch (error) {
@@ -1308,6 +1446,7 @@
                 problematicIds.splice(index, 1); // Remove the id from problematicIds
                 console.log(`ID ${id} removed from problematicIds. Updated array:`, problematicIds); // Debugging: Check the array after removing an ID
             }
+            analysisResults.delete(id);
 
             // Find the element for this ID and remove the 'problematic' class
             const problemItemElement = document.getElementById(`item-${id}`);
@@ -1327,7 +1466,7 @@
 
 
 
-    async function generateWithoutPlayback(chunk, language, characterVoice, RVCVoice, RVCPitch, customFileName, chunkIndex = null) {
+    async function generateWithoutPlayback(chunk, language, characterVoice, RVCVoice, RVCPitch, customFileName, temperature = null, repetitionPenalty = null, chunkIndex = null) {
         // Perform the generation process as usual but do not play the audio
         try {
             let paddedChunkIndex;
@@ -1341,6 +1480,10 @@
             }
 
             const uuid = generateUUID();
+            // Read temperature and repetition penalty from DOM if not provided
+            if (temperature === null) temperature = parseFloat(document.getElementById('temperature').value);
+            if (repetitionPenalty === null) repetitionPenalty = parseFloat(document.getElementById('repetitionPenalty').value);
+
             const data = new URLSearchParams({
                 text_input: chunk.trim(),
                 text_filtering: "standard",
@@ -1356,6 +1499,9 @@
                 autoplay: "false",
                 autoplay_volume: "0.1"
             });
+            // Add optional temperature and repetition penalty
+            data.append('temperature', temperature);
+            data.append('repetition_penalty', repetitionPenalty);
             const response = await fetch(baseUrl + "/api/tts-generate", {
                 method: "POST",
                 headers: {
@@ -1395,6 +1541,101 @@
         }
     }
 
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    let whisperDiffPopover = null;
+
+    function closeWhisperDiffPopover() {
+        if (whisperDiffPopover) {
+            whisperDiffPopover.remove();
+            whisperDiffPopover = null;
+        }
+    }
+
+    function openWhisperDiffPopover(target) {
+        closeWhisperDiffPopover();
+
+        const popover = document.createElement('div');
+        popover.className = 'analysis-popover';
+        popover.innerHTML = `
+            <div class="analysis-popover-row">
+                <span class="analysis-popover-label">Input:</span>
+                <span class="analysis-popover-value">${escapeHtml(target.dataset.input || '∅')}</span>
+            </div>
+            <div class="analysis-popover-row">
+                <span class="analysis-popover-label">Whisper:</span>
+                <span class="analysis-popover-value">${escapeHtml(target.dataset.whisper || '∅')}</span>
+            </div>
+        `;
+
+        document.body.appendChild(popover);
+        whisperDiffPopover = popover;
+
+        const rect = target.getBoundingClientRect();
+        const gap = 8;
+        const edge = 8;
+        let left = rect.left;
+        let top = rect.bottom + gap;
+
+        left = Math.max(edge, Math.min(left, window.innerWidth - popover.offsetWidth - edge));
+        if (top + popover.offsetHeight > window.innerHeight - edge) {
+            top = Math.max(edge, rect.top - popover.offsetHeight - gap);
+        }
+
+        popover.style.left = `${left}px`;
+        popover.style.top = `${top}px`;
+    }
+
+    function renderWhisperDiff(result) {
+        if (!result || !Array.isArray(result.diff)) return '';
+
+        return result.diff.map(part => {
+            const original = Array.isArray(part.original) ? part.original.join(' ') : '';
+            const whisper = Array.isArray(part.whisper) ? part.whisper.join(' ') : '';
+            const originalHtml = escapeHtml(original);
+            const inputAttr = escapeHtml(original || '∅');
+            const whisperAttr = escapeHtml(whisper || '∅');
+
+            if (part.type === 'equal') return originalHtml;
+            if (part.type === 'number_format') return `<span class="analysis-number" role="button" tabindex="0" data-input="${inputAttr}" data-whisper="${whisperAttr}">${originalHtml}</span>`;
+            if (part.type === 'insert') {
+                return `<span class="analysis-insert" role="button" tabindex="0" data-input="${inputAttr}" data-whisper="${whisperAttr}">+ Whisper: ${escapeHtml(whisper)}</span>`;
+            }
+            return `<span class="analysis-mismatch" role="button" tabindex="0" data-input="${inputAttr}" data-whisper="${whisperAttr}">${originalHtml || '∅'}</span>`;
+        }).filter(Boolean).join(' ');
+    }
+
+    document.addEventListener('click', event => {
+        const target = event.target.closest('.analysis-mismatch, .analysis-insert, .analysis-number');
+        if (target) {
+            openWhisperDiffPopover(target);
+            return;
+        }
+        if (!event.target.closest('.analysis-popover')) {
+            closeWhisperDiffPopover();
+        }
+    });
+
+    document.addEventListener('keydown', event => {
+        const target = event.target.closest?.('.analysis-mismatch, .analysis-insert, .analysis-number');
+        if (target && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault();
+            openWhisperDiffPopover(target);
+        } else if (event.key === 'Escape') {
+            closeWhisperDiffPopover();
+        }
+    });
+
+    window.addEventListener('resize', closeWhisperDiffPopover);
+    window.addEventListener('scroll', closeWhisperDiffPopover, true);
+
     function updateUIList() {
         const listDisplay = document.getElementById('ttsListDisplay');
         if (!listDisplay) {
@@ -1403,33 +1644,45 @@
         }
         listDisplay.innerHTML = ''; // Clear the current list
 
-        // Determine the range of items to display for pagination
-        const start = (currentPage - 1) * itemsPerPage;
-        const end = start + itemsPerPage;
-        const paginatedItems = ttsList.slice(start, end);
+        // Render one continuous list. Pagination controls stay hidden for legacy compatibility.
+        const paginatedItems = ttsList;
 
-        // Add items to the display for the current page
+        // Add all items to the display
         paginatedItems.forEach(item => {
             // Extract just the file name from the URL
             const wavFileName = item.fileUrl.split('/').pop();
 
-            // Display only the first 50 characters of the text
+            const analysis = analysisResults.get(Number(item.id));
             const displayText = item.text.length > 175 ? item.text.substring(0, 175) + '...' : item.text;
+            const textHtml = analysis && analysis.diff ? renderWhisperDiff(analysis) : escapeHtml(displayText);
+            const analysisClass = analysis ? ' analysis-text' : '';
+            const textTitleAttr = analysis ? '' : ` title="${escapeHtml(item.text)}"`;
+            const statusLabels = {ok: 'Matched', review: 'Needs review', number_format: 'Number notation'};
+            const status = item.accepted ? 'Accepted' : analysis ? (analysis.status === 'error' ? `Error: ${escapeHtml(analysis.error)}` : `${statusLabels[analysis.status] || 'Needs analysis'} (${Number(analysis.similarity)}%)`) : 'Needs analysis';
+            const scoreHtml = `<span class="analysis-score">${status}</span>`;
 
             const entryDiv = document.createElement('div');
             entryDiv.id = `item-${item.id}`; // Assign an ID to the div for highlighting
             entryDiv.classList.add('ttsListItem'); // Add a class for styling
+            if (problematicIds.includes(item.id)) {
+                entryDiv.classList.add('problematic');
+            }
 
             // Update the Play/Stop button's onclick to call a function that handles playing and highlighting
             entryDiv.innerHTML = `
-        <button onclick="regenerateTTS(${item.id})">Regenerate</button>
-        <button onclick="playSound('${item.fileUrl}', ${item.id})">Play/Stop</button>
-        <span class="label">ID:</span> <span class="value">${item.id}</span>
-        <span class="label">Voice:</span> <span class="value">${item.characterVoice}</span>
-        <span class="label">Language:</span> <span class="value">${item.language}</span>
-        <span class="label">Wav:</span> <span class="value">${wavFileName}</span>
-        <button id="edit-btn-${item.id}" class="edit-btn" onclick="editText(${item.id})">Edit</button>
-        <span class="item-field text-preview value" title="${item.text}" data-fulltext="${item.text}">${displayText}</span>
+        <span class="item-controls">
+            <button onclick="runAnalysis([ttsList.find(item => Number(item.id) === ${Number(item.id)})])" ${analysisBusy ? 'disabled' : ''}>ASR</button>
+            <button onclick="toggleAcceptance(${Number(item.id)})">${item.accepted ? 'Undo accept' : 'Accept'}</button>
+            <button onclick="regenerateTTS(${item.id})">Regenerate</button>
+            <button onclick="playSound('${item.fileUrl}', ${item.id})">Play/Stop</button>
+            <span class="label">ID:</span> <span class="value">${item.id}</span>
+            <span class="label">Voice:</span> <span class="value">${item.characterVoice}</span>
+            <span class="label">Language:</span> <span class="value">${item.language}</span>
+            <span class="label">Wav:</span> <span class="value">${wavFileName}</span>
+            <button id="edit-btn-${item.id}" class="edit-btn" onclick="editText(${item.id})" ${analysisBusy ? 'disabled' : ''}>Edit</button>
+        </span>
+        <span class="item-field text-preview value${analysisClass}"${textTitleAttr} data-fulltext="${escapeHtml(item.text)}">${textHtml}</span>
+        ${scoreHtml}
         `;
             listDisplay.appendChild(entryDiv);
         });
@@ -1445,7 +1698,7 @@
     }
 
 
-    async function generateAndPlayRemote(chunk, language, characterVoice, RVCVoice, RVCPitch, volume, customFileName, chunkIndex = null) {
+    async function generateAndPlayRemote(chunk, language, characterVoice, RVCVoice, RVCPitch, volume, customFileName, temperature = null, repetitionPenalty = null, chunkIndex = null) {
         try {
             if (stopTTSGeneration) {
                 console.log("TTS generation stopped.");
@@ -1463,6 +1716,10 @@
             }
 
             const uuid = generateUUID();
+            // Read temperature and repetition penalty from DOM if not provided
+            if (temperature === null) temperature = parseFloat(document.getElementById('temperature').value);
+            if (repetitionPenalty === null) repetitionPenalty = parseFloat(document.getElementById('repetitionPenalty').value);
+
             const data = new URLSearchParams({
                 text_input: chunk.trim(),
                 text_filtering: "standard",
@@ -1478,6 +1735,9 @@
                 autoplay: "true",
                 autoplay_volume: volume,
             });
+            // Add optional temperature and repetition penalty
+            data.append('temperature', temperature);
+            data.append('repetition_penalty', repetitionPenalty);
             const response = await fetch(baseUrl + "/api/tts-generate", {
                 method: "POST",
                 headers: {
@@ -1507,12 +1767,17 @@
 
     async function generateAndStream(textInput, language, characterVoice, volume) {
         try {
+            const temperature = parseFloat(document.getElementById('temperature').value);
+            const repetitionPenalty = parseFloat(document.getElementById('repetitionPenalty').value);
+
             const queryParams = new URLSearchParams({
                 text: textInput,
                 voice: characterVoice,
                 language: language,
                 output_file: "streaming_file",
-                streaming: "True"
+                streaming: "True",
+                temperature: temperature,
+                repetition_penalty: repetitionPenalty
             });
 
             // Reinitialize currentSound every time
@@ -1862,6 +2127,8 @@
         audioQueue.forEach(sound => sound.unload());
         audioQueue = [];
         ttsList = [];
+        analysisResults.clear();
+        problematicIds = [];
         listPlayIndex = 0; // If listPlayIndex is the correct variable, use it instead of currentlyPlayingIndex
         listPlaying = false; // Assuming listPlaying is the correct variable for list playback state
         currentGenerationId = 0;
@@ -1894,6 +2161,7 @@
     }
 
     function editText(id) {
+        if (analysisBusy) return;
         console.log(`Initiating edit for ID: ${id}`);
         console.log("Before edit, ttsList:", JSON.parse(JSON.stringify(ttsList)));
         // First, check if we're already editing and should save the current value
@@ -1930,6 +2198,7 @@
             const itemIndex = ttsList.findIndex(item => item.id === id);
             if (itemIndex !== -1) {
                 console.log(`Updating ttsList with new text for ID: ${id}`);
+                if (ttsList[itemIndex].text !== this.value) invalidateAnalysis(ttsList[itemIndex]);
                 ttsList[itemIndex].text = this.value;
                 // If this item is in the list of problematic IDs, un-highlight it
                 if (problematicIds.includes(id)) {
@@ -1950,6 +2219,7 @@
             // Replace the input field with the new span
             console.log(`Replacing input field with text span for ID: ${id}`);
             inputField.replaceWith(newTextPreviewSpan);
+            updateUIList();
         });
 
         // Replace the span with the input field
@@ -2004,7 +2274,10 @@
                     try {
                         const jsonData = JSON.parse(e.target.result);
 
-                        ttsList = jsonData;
+                        if (!Array.isArray(jsonData)) throw new Error('Invalid list');
+                        ttsList = jsonData.map(item => ({...item, accepted: item.accepted === true}));
+                        analysisResults.clear();
+                        problematicIds = [];
                         currentPage = 1; // Reset to the first page
                         updateUIList();
                         updateButtonStyles()
@@ -2097,6 +2370,9 @@
             } else {
                 currentSound.play();
             }
+        } else if (audioQueue.length > 0 && currentlyPlayingIndex < audioQueue.length) {
+            // Playback starts only after an explicit user click.
+            playNextLocalChunk();
         }
     }
 
@@ -2322,6 +2598,16 @@
         Howler.volume(parseFloat(value));
     }
 
+    function updateTemperatureValue(value) {
+        document.getElementById('temperatureValue').innerText = value;
+    }
+
+    function updateRepetitionPenaltyValue(value) {
+        // Keep consistent decimal formatting for repetition penalty
+        const formatted = parseFloat(value).toFixed(2).replace(/\.00$/, '');
+        document.getElementById('repetitionPenaltyValue').innerText = formatted;
+    }
+
     function toggleThemeMode() {
         // Retrieve the value of the selected option for themeMode from the dropdown
         const themeModeValue = document.getElementById('themeMode').value;
@@ -2404,6 +2690,20 @@
             updateVolumeValueDisplay(savedVolume); // Update display to match
         }
 
+        // Initialize temperature based on preference
+        const savedTemp = localStorage.getItem('temperature');
+        if (savedTemp) {
+            document.getElementById('temperature').value = savedTemp;
+            updateTemperatureValue(savedTemp);
+        }
+
+        // Initialize repetition penalty based on preference
+        const savedRepetitionPenalty = localStorage.getItem('repetitionPenalty');
+        if (savedRepetitionPenalty) {
+            document.getElementById('repetitionPenalty').value = savedRepetitionPenalty;
+            updateRepetitionPenaltyValue(savedRepetitionPenalty);
+        }
+
         // Add change event listeners to save preferences when they change
         attachEventListeners();
     }
@@ -2428,6 +2728,14 @@
         });
         document.getElementById('volume').addEventListener('input', function () {
             updateVolumeValue(this.value);
+            savePreferences();
+        });
+        document.getElementById('temperature').addEventListener('input', function () {
+            updateTemperatureValue(this.value);
+            savePreferences();
+        });
+        document.getElementById('repetitionPenalty').addEventListener('input', function () {
+            updateRepetitionPenaltyValue(this.value);
             savePreferences();
         });
     }
@@ -2495,6 +2803,14 @@
         // Save volume preference
         const volume = document.getElementById('volume').value;
         localStorage.setItem('volume', volume);
+
+    // Save temperature preference
+    const temperature = document.getElementById('temperature').value;
+    localStorage.setItem('temperature', temperature);
+
+    // Save repetition penalty preference
+    const repetitionPenalty = document.getElementById('repetitionPenalty').value;
+    localStorage.setItem('repetitionPenalty', repetitionPenalty);
 
         // Save dark mode preference
         const isDarkModeEnabled = document.body.classList.contains('dark-mode');
